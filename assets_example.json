@@ -1,0 +1,444 @@
+"""Streamlit UI for Threat Intelligence Risk Prioritization."""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import logging
+import time
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+from src.ingestion.asset_loader import load_assets, SAMPLE_ASSETS
+from src.ingestion.mitre_loader import load_techniques
+from src.ingestion.nvd_fetcher import fetch_recent_cves
+from src.models.risk_scorer import RiskScorer
+from src.features.feature_builder import build_features
+from src.features.vulberta_embedder import VulBertaEmbedder
+from src.prioritization.engine import run_pipeline
+from src.schema import RiskRecord
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+# ──────────────────────────────────────────────────────────
+# Page config
+# ──────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Threat Intel Risk Prioritizer",
+    page_icon="🛡️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ──────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────
+PRIORITY_COLORS = {
+    "CRITICAL": "#d62728",
+    "HIGH":     "#ff7f0e",
+    "MEDIUM":   "#2ca02c",
+    "LOW":      "#1f77b4",
+}
+
+def _badge(priority: str) -> str:
+    color = PRIORITY_COLORS.get(priority, "#888")
+    return f'<span style="background:{color};color:white;padding:2px 8px;border-radius:4px;font-size:0.8em">{priority}</span>'
+
+
+def _records_to_df(records: list[RiskRecord]) -> pd.DataFrame:
+    return pd.DataFrame([r.model_dump() for r in records])
+
+
+# ──────────────────────────────────────────────────────────
+# Session state
+# ──────────────────────────────────────────────────────────
+if "records" not in st.session_state:
+    st.session_state["records"] = []
+if "stats" not in st.session_state:
+    st.session_state["stats"] = {}
+if "scorer" not in st.session_state:
+    st.session_state["scorer"] = None
+if "embedder" not in st.session_state:
+    st.session_state["embedder"] = None
+
+
+@st.cache_resource(show_spinner="Loading VulBERTa model…")
+def _load_embedder() -> VulBertaEmbedder:
+    return VulBertaEmbedder()
+
+
+# ──────────────────────────────────────────────────────────
+# Sidebar — controls
+# ──────────────────────────────────────────────────────────
+with st.sidebar:
+    st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/4/48/Shield_icon.svg/120px-Shield_icon.svg.png", width=60)
+    st.title("🛡️ Settings")
+
+    st.subheader("🤖 CodeBERT")
+    use_vulberta = st.toggle(
+        "Enable CodeBERT embeddings",
+        value=True,
+        help="microsoft/codebert-base — BERT pre-trained on code and technical text. "
+             "Downloads ~500 MB on first run; cached afterwards.",
+    )
+    if use_vulberta:
+        st.caption("CVE descriptions → CodeBERT 768-dim → PCA 32-dim semantic features")
+
+    # GPU / CPU status
+    import torch
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        st.success(f"GPU  {gpu_name} ({vram:.1f} GB VRAM)")
+    else:
+        st.info("CPU only — CodeBERT encoding will be slow on large datasets")
+
+    # ── CVE source ───────────────────────────────────────
+    st.subheader("CVE Data Source")
+    cve_source = st.radio(
+        "Where to get CVE data",
+        ["Live NVD API", "Upload NVD JSON feed"],
+        help="NVD JSON feeds can be downloaded from nvd.nist.gov/vuln/data-feeds",
+    )
+    cve_feed_path = None
+    days_back = 30
+    keywords = None
+    if cve_source == "Live NVD API":
+        days_back = st.slider("CVEs published in the last N days", 7, 90, 30)
+        keywords_raw = st.text_input(
+            "Filter keywords (comma-separated, leave blank for all)",
+            "",
+            help="Each keyword is searched separately. Blank = fetch all CVEs in date range.",
+        )
+        keywords = [k.strip() for k in keywords_raw.split(",") if k.strip()] or None
+        nvd_api_key = st.text_input(
+            "NVD API key (optional — removes rate limit)",
+            type="password",
+            help="Free key from nvd.nist.gov/developers/request-an-api-key — speeds up fetch significantly.",
+        )
+        if nvd_api_key:
+            import os; os.environ["NVD_API_KEY"] = nvd_api_key
+    else:
+        uploaded_cve = st.file_uploader(
+            "Upload NVD JSON feed (.json)",
+            type="json",
+            help='The file downloaded from nvd.nist.gov — contains a "vulnerabilities" array.',
+        )
+        if uploaded_cve:
+            tmp_cve = Path("data/uploaded_nvd_feed.json")
+            tmp_cve.parent.mkdir(exist_ok=True)
+            tmp_cve.write_bytes(uploaded_cve.read())
+            cve_feed_path = str(tmp_cve)
+            st.success(f"Feed loaded: {uploaded_cve.name}")
+        else:
+            st.info("Upload an NVD JSON feed file to proceed.")
+
+    st.subheader("Performance")
+    max_cves = st.select_slider(
+        "Max CVEs to process",
+        options=[100, 250, 500, 1000, 2500, 5000, 10000, 23845],
+        value=500,
+        help="Limit CVEs for faster runs. 500 → ~30 sec on CPU. 23845 (full feed) → hours on CPU, ~10 min on GPU.",
+    )
+    load_mitre = st.checkbox("Load MITRE ATT&CK techniques", value=True,
+                              help="Downloads ~10 MB on first run; cached afterwards.")
+
+    # ── Asset source ─────────────────────────────────────
+    st.subheader("Assets (your organization)")
+    st.caption("Your servers, workstations, and network devices — NOT CVE data.")
+    use_sample = st.radio("Asset source", ["Sample assets (built-in)", "Upload assets JSON"])
+    asset_path = None
+    if use_sample == "Upload assets JSON":
+        uploaded = st.file_uploader(
+            "Upload assets.json",
+            type="json",
+            help='List of objects with: asset_id, name, asset_type, criticality (0-10), exposure (0-1), cpe',
+        )
+        if uploaded:
+            tmp = Path("data/uploaded_assets.json")
+            tmp.parent.mkdir(exist_ok=True)
+            tmp.write_bytes(uploaded.read())
+            asset_path = str(tmp)
+            st.success(f"Assets loaded: {uploaded.name}")
+
+    st.subheader("Display")
+    priority_filter = st.multiselect(
+        "Show priorities",
+        ["CRITICAL", "HIGH", "MEDIUM", "LOW"],
+        default=["CRITICAL", "HIGH", "MEDIUM", "LOW"],
+    )
+    max_rows = st.slider("Max rows in table", 20, 500, 100)
+
+    run_btn = st.button("▶  Run Pipeline", type="primary", use_container_width=True)
+
+    st.divider()
+    retrain_btn = st.button("🔄  Force Retrain Model", use_container_width=True)
+
+
+# ──────────────────────────────────────────────────────────
+# Pipeline trigger
+# ──────────────────────────────────────────────────────────
+if run_btn:
+    if cve_source == "Upload NVD JSON feed" and not cve_feed_path:
+        st.error("Please upload an NVD JSON feed file before running the pipeline.")
+    else:
+        embedder = _load_embedder() if use_vulberta else None
+        with st.spinner("Running threat intelligence pipeline…"):
+            t0 = time.time()
+            records, scorer, stats = run_pipeline(
+                days_back=days_back,
+                keywords=keywords,
+                asset_path=asset_path,
+                cve_feed_path=cve_feed_path,
+                max_cves=max_cves,
+                load_mitre=load_mitre,
+                embedder=embedder,
+            )
+            elapsed = time.time() - t0
+        st.session_state["records"] = records
+        st.session_state["stats"] = stats | {"elapsed": round(elapsed, 1)}
+        st.session_state["scorer"] = scorer
+        st.session_state["embedder"] = embedder
+
+        if not records:
+            st.warning(
+                "Pipeline ran but returned **0 CVEs**. "
+                "Possible causes:\n"
+                "- NVD API rate limit hit (no API key). Try again in 30 seconds.\n"
+                "- Keywords too specific — clear the keywords field and try again.\n"
+                "- NVD API is temporarily down — check https://nvd.nist.gov/general/nvd-dashboard"
+            )
+        else:
+            vulberta_note = " · CodeBERT ON" if use_vulberta else " · CodeBERT OFF"
+            st.success(f"Pipeline complete in {elapsed:.1f}s — {len(records)} risk pairs generated{vulberta_note}.")
+
+if retrain_btn:
+    model_p = Path("data/risk_model.pkl")
+    scaler_p = Path("data/risk_scaler.pkl")
+    model_p.unlink(missing_ok=True)
+    scaler_p.unlink(missing_ok=True)
+    st.info("Cached model deleted. Next pipeline run will retrain from scratch.")
+
+
+# ──────────────────────────────────────────────────────────
+# Main content
+# ──────────────────────────────────────────────────────────
+st.title("🛡️ Threat Intelligence Risk Prioritizer")
+st.caption("ML-based CVE × Asset risk scoring using NVD + MITRE ATT&CK")
+
+records: list[RiskRecord] = st.session_state["records"]
+stats: dict = st.session_state["stats"]
+scorer: RiskScorer | None = st.session_state["scorer"]
+
+if not records:
+    st.info("Configure settings in the sidebar and click **▶ Run Pipeline** to start.")
+
+    st.subheader("Sample Assets (built-in)")
+    sample_df = pd.DataFrame([a.model_dump() for a in SAMPLE_ASSETS])
+    st.dataframe(sample_df, use_container_width=True)
+    st.stop()
+
+# ── KPI strip ────────────────────────────────────────────
+c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1.metric("CVEs Fetched",  stats.get("total_cves", 0))
+c2.metric("Assets",        stats.get("total_assets", 0))
+c3.metric("Risk Pairs",    stats.get("total_pairs", 0))
+c4.metric("🔴 CRITICAL",  stats.get("critical", 0))
+c5.metric("🟠 HIGH",      stats.get("high", 0))
+c6.metric("⏱ Runtime (s)", stats.get("elapsed", "—"))
+
+st.divider()
+
+# ── Tabs ─────────────────────────────────────────────────
+tab_overview, tab_table, tab_cve, tab_asset, tab_model = st.tabs([
+    "📊 Overview", "📋 Risk Table", "🔎 CVE Detail", "🏢 Asset View", "🤖 Model Insights"
+])
+
+df_all = _records_to_df(records)
+df = df_all[df_all["priority"].isin(priority_filter)].head(max_rows)
+
+
+# ── Tab 1: Overview ──────────────────────────────────────
+with tab_overview:
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        st.subheader("Priority Distribution")
+        counts = df_all["priority"].value_counts().reindex(
+            ["CRITICAL", "HIGH", "MEDIUM", "LOW"], fill_value=0
+        ).reset_index()
+        counts.columns = ["Priority", "Count"]
+        fig_pie = px.pie(
+            counts, values="Count", names="Priority",
+            color="Priority",
+            color_discrete_map=PRIORITY_COLORS,
+            hole=0.4,
+        )
+        fig_pie.update_traces(textposition="inside", textinfo="percent+label")
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+    with col_right:
+        st.subheader("Risk Score Distribution")
+        fig_hist = px.histogram(
+            df_all, x="risk_score", nbins=30,
+            color="priority",
+            color_discrete_map=PRIORITY_COLORS,
+            labels={"risk_score": "Risk Score", "count": "Count"},
+        )
+        st.plotly_chart(fig_hist, use_container_width=True)
+
+    st.subheader("Top 20 Risk Pairs — CVE × Asset")
+    top20 = df_all.head(20).copy()
+    fig_bar = px.bar(
+        top20, x="risk_score", y="cve_id",
+        color="priority", orientation="h",
+        color_discrete_map=PRIORITY_COLORS,
+        hover_data=["asset_name", "cvss_score", "asset_criticality"],
+        labels={"risk_score": "Risk Score", "cve_id": "CVE"},
+    )
+    fig_bar.update_layout(yaxis={"categoryorder": "total ascending"}, height=500)
+    st.plotly_chart(fig_bar, use_container_width=True)
+
+
+# ── Tab 2: Risk Table ────────────────────────────────────
+with tab_table:
+    st.subheader(f"Risk Records ({len(df)} shown)")
+
+    display_cols = [
+        "cve_id", "asset_name", "priority", "risk_score",
+        "cvss_score", "exploitability_score", "asset_criticality",
+        "asset_exposure", "recommendation",
+    ]
+    st.dataframe(
+        df[display_cols].style.background_gradient(
+            subset=["risk_score", "cvss_score"], cmap="RdYlGn_r"
+        ),
+        use_container_width=True,
+        height=500,
+    )
+
+    csv = df[display_cols].to_csv(index=False).encode()
+    st.download_button("⬇ Download CSV", csv, "risk_report.csv", "text/csv")
+
+
+# ── Tab 3: CVE Detail ────────────────────────────────────
+with tab_cve:
+    st.subheader("CVE Explorer")
+    cve_ids = sorted(df_all["cve_id"].unique())
+    selected_cve = st.selectbox("Select CVE", cve_ids)
+    if selected_cve:
+        cve_df = df_all[df_all["cve_id"] == selected_cve].sort_values("risk_score", ascending=False)
+        st.markdown(f"**{selected_cve}** — CVSS: `{cve_df['cvss_score'].iloc[0]:.1f}`")
+
+        fig_scatter = px.scatter(
+            cve_df, x="asset_criticality", y="risk_score",
+            color="priority", size="asset_exposure",
+            hover_data=["asset_name", "cvss_score"],
+            color_discrete_map=PRIORITY_COLORS,
+            labels={"asset_criticality": "Asset Criticality", "risk_score": "Risk Score"},
+            title=f"Risk Score vs Asset Criticality for {selected_cve}",
+        )
+        st.plotly_chart(fig_scatter, use_container_width=True)
+        st.dataframe(cve_df[["asset_name", "priority", "risk_score", "recommendation"]],
+                     use_container_width=True)
+
+
+# ── Tab 4: Asset View ────────────────────────────────────
+with tab_asset:
+    st.subheader("Asset Risk Summary")
+    asset_summary = (
+        df_all.groupby(["asset_id", "asset_name"])
+        .agg(
+            total_pairs=("risk_score", "count"),
+            max_risk=("risk_score", "max"),
+            avg_risk=("risk_score", "mean"),
+            critical_count=("priority", lambda x: (x == "CRITICAL").sum()),
+            high_count=("priority", lambda x: (x == "HIGH").sum()),
+        )
+        .reset_index()
+        .sort_values("max_risk", ascending=False)
+    )
+
+    fig_asset = px.bar(
+        asset_summary, x="asset_name", y="max_risk",
+        color="max_risk", color_continuous_scale="RdYlGn_r",
+        hover_data=["critical_count", "high_count", "total_pairs"],
+        labels={"max_risk": "Max Risk Score", "asset_name": "Asset"},
+        title="Highest Risk Score per Asset",
+    )
+    fig_asset.update_layout(xaxis_tickangle=-30)
+    st.plotly_chart(fig_asset, use_container_width=True)
+    st.dataframe(asset_summary, use_container_width=True)
+
+
+# ── Tab 5: Model Insights ────────────────────────────────
+with tab_model:
+    import torch as _torch
+    vulberta_on = stats.get("vulberta_enabled", False)
+
+    if _torch.cuda.is_available():
+        _gpu = _torch.cuda.get_device_name(0)
+        _vram = _torch.cuda.get_device_properties(0).total_memory / 1024**3
+        device_label = f"GPU — {_gpu} ({_vram:.1f} GB)"
+        device_color = "normal"
+    else:
+        device_label = "CPU"
+        device_color = "off"
+
+    col_info1, col_info2, col_info3 = st.columns(3)
+    col_info1.metric("ML Model", "GradientBoostingRegressor")
+    col_info2.metric("CodeBERT", "ON — 32 dims" if vulberta_on else "OFF")
+    col_info3.metric("Device", device_label)
+
+    if vulberta_on:
+        st.info(
+            "**VulBERTa** (`mrm8488/vulBERTa-mlm`) encodes each CVE description into a "
+            "768-dim vector via mean pooling, then PCA reduces it to 32 dimensions. "
+            "These semantic features are concatenated with tabular CVSS/asset features "
+            "before the Gradient Boosting model scores each CVE × Asset pair."
+        )
+
+    st.subheader("Feature Importance")
+    fi = stats.get("feature_importance", {})
+    if fi:
+        fi_df = (
+            pd.Series(fi)
+            .reset_index()
+            .rename(columns={"index": "Feature", 0: "Importance"})
+            .sort_values("Importance", ascending=True)
+        )
+        # highlight the VulBERTa bar
+        colors = [
+            "#e377c2" if f == "vulberta_embeddings" else "#1f77b4"
+            for f in fi_df["Feature"]
+        ]
+        fig_fi = px.bar(
+            fi_df, x="Importance", y="Feature", orientation="h",
+            color="Feature",
+            color_discrete_map={"vulberta_embeddings": "#e377c2"},
+            title="Gradient Boosting Feature Importance (emb_* aggregated → vulberta_embeddings)",
+        )
+        st.plotly_chart(fig_fi, use_container_width=True)
+    else:
+        st.info("Run the pipeline to see feature importance.")
+
+    st.subheader("Risk Score vs CVSS (sampled)")
+    sample = df_all.sample(min(500, len(df_all)), random_state=42)
+    fig_scatter2 = px.scatter(
+        sample, x="cvss_score", y="risk_score",
+        color="priority", opacity=0.6,
+        color_discrete_map=PRIORITY_COLORS,
+        labels={"cvss_score": "CVSS Score", "risk_score": "ML Risk Score"},
+        title="ML Risk Score vs CVSS — semantic features shift scores away from pure CVSS",
+    )
+    st.plotly_chart(fig_scatter2, use_container_width=True)
+
+    st.caption(
+        "Model: GradientBoostingRegressor (sklearn) · "
+        "Text encoder: microsoft/codebert-base (BERT pre-trained on code & technical text) · "
+        "Embeddings cached on disk after first run."
+    )
